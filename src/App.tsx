@@ -1,7 +1,8 @@
 import { useState } from "react";
-import reactLogo from "./assets/react.svg";
 import { invoke } from "@tauri-apps/api/core";
-import "./App.css";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 
 function App() {
   const [greetMsg, setGreetMsg] = useState("");
@@ -13,37 +14,47 @@ function App() {
   }
 
   return (
-    <main className="container">
-      <h1>Welcome to Tauri + React</h1>
+    <main className="flex min-h-screen items-center justify-center px-6 py-12">
+      <div className="w-full max-w-xl space-y-8 rounded-2xl border border-border/70 bg-card/80 p-8 shadow-2xl shadow-cyan-900/30 backdrop-blur">
+        <div className="space-y-3">
+          <div className="inline-flex items-center gap-2 rounded-full bg-primary/10 px-3 py-1 text-sm font-semibold text-primary-foreground/90 ring-1 ring-primary/30">
+            <span className="h-2 w-2 animate-pulse rounded-full bg-primary" aria-hidden />
+            Tauri notifier
+          </div>
+          <h1 className="text-3xl font-semibold text-foreground sm:text-4xl">Welcome to your desktop helper</h1>
+          <p className="text-muted-foreground">
+            Send a quick greeting from the Rust backend to make sure everything is wired up. Tailwind + shadcn/ui are now
+            ready for reuse.
+          </p>
+        </div>
 
-      <div className="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
+        <form
+          className="space-y-4"
+          onSubmit={(e) => {
+            e.preventDefault();
+            greet();
+          }}
+        >
+          <div className="space-y-2">
+            <Label htmlFor="greet-input">Name</Label>
+            <Input
+              id="greet-input"
+              value={name}
+              onChange={(e) => setName(e.currentTarget.value)}
+              placeholder="Ada Lovelace"
+            />
+          </div>
+          <Button type="submit" className="w-full">
+            Greet from Rust
+          </Button>
+        </form>
+
+        {greetMsg && (
+          <div className="rounded-lg border border-border/60 bg-white/5 px-4 py-3 text-sm text-foreground shadow-sm shadow-black/20">
+            {greetMsg}
+          </div>
+        )}
       </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
-
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
-        }}
-      >
-        <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
-        />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg}</p>
     </main>
   );
 }

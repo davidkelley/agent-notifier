@@ -22,7 +22,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tauri::plugin::PermissionState;
 #[cfg(desktop)]
-use tauri::{image::Image, menu::MenuBuilder, menu::MenuItem, tray::TrayIconBuilder};
+use tauri::{image::Image, menu::MenuBuilder, menu::MenuItem, tray::TrayIconBuilder, Manager};
 use tauri_plugin_notification::NotificationExt;
 use tokio::{task, time};
 use tokio_stream::{wrappers::IntervalStream, StreamExt};
@@ -442,6 +442,7 @@ fn start_http_server(app: tauri::AppHandle, listening: Arc<AtomicBool>) {
 
 #[cfg(desktop)]
 fn setup_tray(app: &tauri::AppHandle, listening: Arc<AtomicBool>) -> tauri::Result<()> {
+    let open_item = MenuItem::with_id(app, "open_window", "Open", true, None::<&str>)?;
     let start_item = MenuItem::with_id(
         app,
         "start_listening",
@@ -458,6 +459,8 @@ fn setup_tray(app: &tauri::AppHandle, listening: Arc<AtomicBool>) -> tauri::Resu
     }
 
     let menu = MenuBuilder::new(app)
+        .item(&open_item)
+        .separator()
         .item(&start_item)
         .item(&stop_item)
         .separator()
@@ -479,6 +482,21 @@ fn setup_tray(app: &tauri::AppHandle, listening: Arc<AtomicBool>) -> tauri::Resu
         let stop_item = stop_item.clone();
         move |app, event| match event.id().as_ref() {
             "quit" => app.exit(0),
+            "open_window" => {
+                if let Some(window) = app.get_webview_window("main") {
+                    if let Err(err) = window.show() {
+                        eprintln!("Failed to show main window: {err}");
+                    }
+                    if let Err(err) = window.unminimize() {
+                        eprintln!("Failed to unminimize main window: {err}");
+                    }
+                    if let Err(err) = window.set_focus() {
+                        eprintln!("Failed to focus main window: {err}");
+                    }
+                } else {
+                    eprintln!("Main window not found when handling tray 'Open'");
+                }
+            }
             "stop_listening" => {
                 listening.store(false, Ordering::SeqCst);
                 if let Err(err) = stop_item.set_enabled(false) {
