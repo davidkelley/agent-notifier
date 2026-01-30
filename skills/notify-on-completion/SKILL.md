@@ -1,5 +1,5 @@
 ---
-name: Notify on Completion
+name: notify-on-completion
 description: Send local completion notifications to the Agent Notifications app via POST http://127.0.0.1:60766/agent/notify after finishing a task; include title, content, and agent details so the desktop app shows a system notification.
 ---
 
