@@ -6,6 +6,8 @@
 
 A tiny application that displays desktop notifications for any agent running locally or remotely, once they complete their work.
 
+![Example notification](.github/images/macos-notification.png)
+
 Download the latest release from the [Releases](https://github.com/davidkelley/agent-notifier/releases) page for your OS.
 
 - **MCP Server**: Add Agent Notifier as an MCP server in your agent framework of choice.
