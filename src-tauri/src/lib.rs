@@ -17,13 +17,22 @@ use axum::{
     routing::post,
     Json, Router,
 };
+#[cfg(target_os = "macos")]
+use cocoa::appkit::{NSColor, NSWindow};
+#[cfg(target_os = "macos")]
+use cocoa::base::{id, nil, YES};
 use rodio::{Decoder, OutputStream, Sink};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::plugin::PermissionState;
 #[cfg(desktop)]
-use tauri::{image::Image, menu::MenuBuilder, menu::MenuItem, tray::TrayIconBuilder, Manager};
+use tauri::{image::Image, menu::MenuBuilder, menu::MenuItem, tray::TrayIconBuilder};
+use tauri::{
+    plugin::PermissionState, webview::Color, Manager, TitleBarStyle, WebviewUrl,
+    WebviewWindowBuilder, WindowEvent,
+};
 use tauri_plugin_notification::NotificationExt;
+use tauri_plugin_store::StoreExt;
+use tokio::sync::{Mutex, RwLock};
 use tokio::{task, time};
 use tokio_stream::{wrappers::IntervalStream, StreamExt};
 
@@ -32,11 +41,37 @@ const DEFAULT_SOUND: &[u8] = include_bytes!("../sounds/Ping.wav");
 const DISABLE_SOUND_ENV: &str = "AGENT_NOTIFIER_DISABLE_SOUND";
 // MCP HTTP Stream transport as of the 2025-11-25 specification.
 const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
+const STORE_FILE: &str = "settings.json";
+const HTTP_SETTINGS_KEY: &str = "httpBindings";
+// Theme background: oklch(0.1649 0.0352 281.8285) ≈ #0c0c1d.
+const THEME_BACKGROUND_COLOR: Color = Color(12, 12, 29, 255);
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
+}
+
+#[tauri::command]
+async fn get_http_bindings(state: tauri::State<'_, ManagedState>) -> Result<HttpSettings, String> {
+    Ok(state.settings.read().await.clone())
+}
+
+#[tauri::command]
+async fn save_http_bindings(
+    settings: HttpSettings,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, ManagedState>,
+) -> Result<(), String> {
+    validate_http_settings(&settings)?;
+
+    {
+        let mut guard = state.settings.write().await;
+        *guard = settings.clone();
+    }
+
+    persist_http_settings(&app, &settings)?;
+    restart_http_server(&app, &state).await
 }
 
 #[derive(Clone)]
@@ -50,6 +85,27 @@ struct NotifyRequest {
     title: String,
     content: String,
     agent: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HttpSettings {
+    bind_address: String,
+    port: u16,
+}
+
+impl Default for HttpSettings {
+    fn default() -> Self {
+        Self {
+            bind_address: "127.0.0.1".into(),
+            port: 60766,
+        }
+    }
+}
+
+struct ManagedState {
+    listening: Arc<AtomicBool>,
+    server_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    settings: RwLock<HttpSettings>,
 }
 
 // Windows toast text blocks cap at 1024 chars; keep a conservative ceiling to avoid truncation.
@@ -415,9 +471,56 @@ async fn mcp_get_handler(State(state): State<AppState>) -> impl IntoResponse {
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(25)))
         .into_response()
 }
-fn start_http_server(app: tauri::AppHandle, listening: Arc<AtomicBool>) {
-    // Use Tauri's async runtime so the task shares the app's lifecycle and keeps the main
-    // thread free for the UI.
+fn validate_http_settings(settings: &HttpSettings) -> Result<(), String> {
+    if settings.bind_address.trim().is_empty() {
+        return Err("Bind address cannot be empty".into());
+    }
+    if settings.port == 0 {
+        return Err("Port must be between 1 and 65535".into());
+    }
+    Ok(())
+}
+
+fn load_http_settings(app: &tauri::AppHandle) -> HttpSettings {
+    let store = match app.store(STORE_FILE) {
+        Ok(store) => store,
+        Err(err) => {
+            eprintln!("Failed to open settings store: {err}");
+            return HttpSettings::default();
+        }
+    };
+
+    match store.get(HTTP_SETTINGS_KEY) {
+        Some(value) => match serde_json::from_value::<HttpSettings>(value.clone()) {
+            Ok(settings) => settings,
+            Err(err) => {
+                eprintln!("Failed to parse stored HTTP settings: {err}");
+                HttpSettings::default()
+            }
+        },
+        None => HttpSettings::default(),
+    }
+}
+
+fn persist_http_settings(app: &tauri::AppHandle, settings: &HttpSettings) -> Result<(), String> {
+    let store = app
+        .store(STORE_FILE)
+        .map_err(|err| format!("Failed to open settings store: {err}"))?;
+    store.set(
+        HTTP_SETTINGS_KEY,
+        serde_json::to_value(settings)
+            .map_err(|err| format!("Failed to serialize HTTP settings: {err}"))?,
+    );
+    store
+        .save()
+        .map_err(|err| format!("Failed to save HTTP settings: {err}"))
+}
+
+fn spawn_http_server(
+    app: tauri::AppHandle,
+    listening: Arc<AtomicBool>,
+    settings: HttpSettings,
+) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
         let state = AppState { app, listening };
         let router = Router::new()
@@ -425,11 +528,11 @@ fn start_http_server(app: tauri::AppHandle, listening: Arc<AtomicBool>) {
             .route("/mcp", post(mcp_post_handler).get(mcp_get_handler))
             .with_state(state);
 
-        // Bind explicitly to loopback to avoid exposing the server externally.
-        let listener = match tokio::net::TcpListener::bind("127.0.0.1:60766").await {
+        let bind_addr = format!("{}:{}", settings.bind_address, settings.port);
+        let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
             Ok(listener) => listener,
             Err(err) => {
-                eprintln!("HTTP server failed to bind 127.0.0.1:60766: {err}");
+                eprintln!("HTTP server failed to bind {bind_addr}: {err}");
                 return;
             }
         };
@@ -437,12 +540,27 @@ fn start_http_server(app: tauri::AppHandle, listening: Arc<AtomicBool>) {
         if let Err(err) = axum::serve(listener, router).await {
             eprintln!("HTTP server error: {err}");
         }
-    });
+    })
+}
+
+async fn restart_http_server(app: &tauri::AppHandle, managed: &ManagedState) -> Result<(), String> {
+    let settings = { managed.settings.read().await.clone() };
+
+    let mut guard = managed.server_task.lock().await;
+    if let Some(handle) = guard.take() {
+        handle.abort();
+    }
+    *guard = Some(spawn_http_server(
+        app.clone(),
+        managed.listening.clone(),
+        settings,
+    ));
+    Ok(())
 }
 
 #[cfg(desktop)]
 fn setup_tray(app: &tauri::AppHandle, listening: Arc<AtomicBool>) -> tauri::Result<()> {
-    let open_item = MenuItem::with_id(app, "open_window", "Open", true, None::<&str>)?;
+    let open_item = MenuItem::with_id(app, "open_window", "Settings", true, None::<&str>)?;
     let start_item = MenuItem::with_id(
         app,
         "start_listening",
@@ -494,7 +612,7 @@ fn setup_tray(app: &tauri::AppHandle, listening: Arc<AtomicBool>) -> tauri::Resu
                         eprintln!("Failed to focus main window: {err}");
                     }
                 } else {
-                    eprintln!("Main window not found when handling tray 'Open'");
+                    eprintln!("Main window not found when handling tray 'Settings'");
                 }
             }
             "stop_listening" => {
@@ -534,17 +652,78 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_store::Builder::default().build())
         .setup(|app| {
-            // Fire and forget: the task stops automatically when the process exits.
             let app_handle = app.handle();
+            let mut window_builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
+                .title("Settings")
+                .inner_size(860.0, 680.0)
+                .background_color(THEME_BACKGROUND_COLOR)
+                .resizable(true)
+                // Start hidden; the user opens it from the tray.
+                .visible(false);
+
+            #[cfg(target_os = "macos")]
+            {
+                window_builder = window_builder.title_bar_style(TitleBarStyle::Transparent);
+            }
+
+            let window = window_builder.build()?;
+
+            // Keep the app alive when the user clicks the window close button.
+            let window_for_close = window.clone();
+            window.on_window_event(move |event| {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    if let Err(err) = window_for_close.hide() {
+                        eprintln!("Failed to hide main window on close: {err}");
+                    }
+                }
+            });
+
+            #[cfg(target_os = "macos")]
+            {
+                if let Ok(ns_window) = window.ns_window() {
+                    let ns_window = ns_window as id;
+                    unsafe {
+                        let (r, g, b) = (
+                            THEME_BACKGROUND_COLOR.0 as f64 / 255.0,
+                            THEME_BACKGROUND_COLOR.1 as f64 / 255.0,
+                            THEME_BACKGROUND_COLOR.2 as f64 / 255.0,
+                        );
+                        let bg = NSColor::colorWithRed_green_blue_alpha_(nil, r, g, b, 1.0);
+                        ns_window.setTitlebarAppearsTransparent_(YES);
+                        ns_window.setBackgroundColor_(bg);
+                    }
+                }
+            }
+
+            // Fire and forget: the task stops automatically when the process exits.
             let listening = Arc::new(AtomicBool::new(true));
             ensure_notification_permission(&app_handle);
-            start_http_server(app_handle.clone(), listening.clone());
+            let initial_settings = load_http_settings(&app_handle);
+            let managed_state = ManagedState {
+                listening: listening.clone(),
+                server_task: Mutex::new(None),
+                settings: RwLock::new(initial_settings.clone()),
+            };
+
+            tauri::async_runtime::block_on(async {
+                let handle =
+                    spawn_http_server(app_handle.clone(), listening.clone(), initial_settings);
+                *managed_state.server_task.lock().await = Some(handle);
+            });
+
+            app.manage(managed_state);
             #[cfg(desktop)]
             setup_tray(&app_handle, listening)?;
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![greet])
+        .invoke_handler(tauri::generate_handler![
+            greet,
+            get_http_bindings,
+            save_http_bindings
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
