@@ -223,6 +223,53 @@ fn dispatch_notification(
     Ok(())
 }
 
+fn validate_permission_request_fields(
+    command: &str,
+    reason: &str,
+    agent: &str,
+    risk: &str,
+    timeout_seconds: Option<i64>,
+    context_url: Option<&str>,
+) -> Result<(String, String, String, String, Option<i64>, Option<String>), String> {
+    let command = command.trim();
+    let reason = reason.trim();
+    let agent = agent.trim();
+    let risk = risk.trim().to_ascii_lowercase();
+
+    if command.is_empty() || reason.is_empty() || agent.is_empty() || risk.is_empty() {
+        return Err("'command', 'reason', 'agent', and 'risk' are required".into());
+    }
+
+    let risk = match risk.as_str() {
+        "low" | "medium" | "high" => risk,
+        _ => return Err("'risk' must be one of: low, medium, high".into()),
+    };
+
+    if let Some(timeout) = timeout_seconds {
+        if timeout < 1 || timeout > 86_400 {
+            return Err("'timeoutSeconds' must be between 1 and 86400".into());
+        }
+    }
+
+    let context_url = context_url.and_then(|u| {
+        let trimmed = u.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
+    });
+
+    Ok((
+        command.to_owned(),
+        reason.to_owned(),
+        agent.to_owned(),
+        risk,
+        timeout_seconds,
+        context_url,
+    ))
+}
+
 fn notify_tool_descriptor() -> Value {
     json!({
         "name": "notify",
@@ -235,6 +282,26 @@ fn notify_tool_descriptor() -> Value {
                 "agent": { "type": "string", "minLength": 1 }
             },
             "required": ["title", "content", "agent"],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn notify_permission_tool_descriptor() -> Value {
+    json!({
+        "name": "notify_permission_request",
+        "description": "Send a desktop notification asking the user to approve a pending command, including command, reason, agent name, risk level, and optional timeout or context URL.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "command": { "type": "string", "minLength": 1 },
+                "reason": { "type": "string", "minLength": 1 },
+                "agent": { "type": "string", "minLength": 1 },
+                "risk": { "type": "string", "enum": ["low", "medium", "high"] },
+                "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
+                "contextUrl": { "type": "string", "format": "uri" }
+            },
+            "required": ["command", "reason", "agent", "risk"],
             "additionalProperties": false
         }
     })
@@ -346,7 +413,7 @@ async fn mcp_post_handler(
         }
         "tools/list" => {
             let result = json!({
-                "tools": [notify_tool_descriptor()],
+                "tools": [notify_tool_descriptor(), notify_permission_tool_descriptor()],
                 "nextCursor": Value::Null
             });
             (StatusCode::OK, Json(jsonrpc_success(id, result))).into_response()
@@ -376,14 +443,6 @@ async fn mcp_post_handler(
                     .into_response();
             };
 
-            if tool_name != "notify" {
-                return (
-                    StatusCode::OK,
-                    Json(jsonrpc_error(Some(id), -32601, "Tool not found")),
-                )
-                    .into_response();
-            }
-
             let Some(arguments) = param_obj.get("arguments").and_then(Value::as_object) else {
                 return (
                     StatusCode::OK,
@@ -396,56 +455,156 @@ async fn mcp_post_handler(
                     .into_response();
             };
 
-            let title = arguments
-                .get("title")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let content = arguments
-                .get("content")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let agent = arguments
-                .get("agent")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
+            match tool_name {
+                "notify" => {
+                    let title = arguments
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let content = arguments
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let agent = arguments
+                        .get("agent")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
 
-            let Ok((title, content, agent)) = validate_notification_fields(title, content, agent)
-            else {
-                return (
-                    StatusCode::OK,
-                    Json(jsonrpc_error(
-                        Some(id),
-                        -32602,
-                        "Invalid params: 'title', 'content', and 'agent' are required and must be within limits",
-                    )),
-                )
-                    .into_response();
-            };
+                    let Ok((title, content, agent)) =
+                        validate_notification_fields(title, content, agent)
+                    else {
+                        return (
+                            StatusCode::OK,
+                            Json(jsonrpc_error(
+                                Some(id),
+                                -32602,
+                                "Invalid params: 'title', 'content', and 'agent' are required and must be within limits",
+                            )),
+                        )
+                            .into_response();
+                    };
 
-            if let Err(err) = dispatch_notification(&state, &title, &content, &agent) {
-                eprintln!("{err}");
-                return (
-                    StatusCode::OK,
-                    Json(jsonrpc_error(
-                        Some(id),
-                        -32000,
-                        "Failed to dispatch notification",
-                    )),
-                )
-                    .into_response();
-            }
-
-            let result = json!({
-                "content": [
-                    {
-                        "type": "text",
-                        "text": format!("Notification sent: {title}")
+                    if let Err(err) = dispatch_notification(&state, &title, &content, &agent) {
+                        eprintln!("{err}");
+                        return (
+                            StatusCode::OK,
+                            Json(jsonrpc_error(
+                                Some(id),
+                                -32000,
+                                "Failed to dispatch notification",
+                            )),
+                        )
+                            .into_response();
                     }
-                ],
-                "isError": false
-            });
 
-            (StatusCode::OK, Json(jsonrpc_success(id, result))).into_response()
+                    let result = json!({
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": format!("Notification sent: {title}")
+                            }
+                        ],
+                        "isError": false
+                    });
+
+                    (StatusCode::OK, Json(jsonrpc_success(id, result))).into_response()
+                }
+                "notify_permission_request" => {
+                    let command = arguments
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let reason = arguments
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let agent = arguments
+                        .get("agent")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let risk = arguments
+                        .get("risk")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let timeout_seconds = arguments.get("timeoutSeconds").and_then(Value::as_i64);
+                    let context_url = arguments.get("contextUrl").and_then(Value::as_str);
+
+                    let Ok((command, reason, agent, risk, timeout_seconds, context_url)) =
+                        validate_permission_request_fields(
+                            command,
+                            reason,
+                            agent,
+                            risk,
+                            timeout_seconds,
+                            context_url,
+                        )
+                    else {
+                        return (
+                            StatusCode::OK,
+                            Json(jsonrpc_error(
+                                Some(id),
+                                -32602,
+                                "Invalid params: permission request fields are required and must be within limits",
+                            )),
+                        )
+                            .into_response();
+                    };
+
+                    let timeout_line = timeout_seconds
+                        .map(|t| format!("Respond within: {t}s"))
+                        .unwrap_or_default();
+                    let context_line = context_url
+                        .map(|u| format!("Context: {u}"))
+                        .unwrap_or_default();
+
+                    let mut lines = vec![
+                        format!("{agent} needs approval"),
+                        format!("Command: {command}"),
+                        format!("Why: {reason}"),
+                        format!("Risk: {risk}"),
+                    ];
+                    if !timeout_line.is_empty() {
+                        lines.push(timeout_line);
+                    }
+                    if !context_line.is_empty() {
+                        lines.push(context_line);
+                    }
+
+                    let content = lines.join("\n");
+
+                    if let Err(err) =
+                        dispatch_notification(&state, "Permission needed", &content, &agent)
+                    {
+                        eprintln!("{err}");
+                        return (
+                            StatusCode::OK,
+                            Json(jsonrpc_error(
+                                Some(id),
+                                -32000,
+                                "Failed to dispatch notification",
+                            )),
+                        )
+                            .into_response();
+                    }
+
+                    let result = json!({
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Permission request notification sent"
+                            }
+                        ],
+                        "isError": false
+                    });
+
+                    (StatusCode::OK, Json(jsonrpc_success(id, result))).into_response()
+                }
+                _ => (
+                    StatusCode::OK,
+                    Json(jsonrpc_error(Some(id), -32601, "Tool not found")),
+                )
+                    .into_response(),
+            }
         }
         _ => (
             StatusCode::OK,
